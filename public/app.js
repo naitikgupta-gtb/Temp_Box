@@ -8,6 +8,7 @@
   const STORE_KEY = 'tmpmail.state.v1';
   const POLL_MS = 3000;
   const IDLE_POLL_EVERY = 5; // poll other inboxes every Nth tick
+  const RATE_LIMIT_BACKOFF_MS = 30000; // pause polling after an HTTP 429
 
   const $ = (id) => document.getElementById(id);
 
@@ -26,6 +27,7 @@
     htmlView: false,
     tickCount: 0,
     busy: false,
+    backoffUntil: 0,
   };
 
   // Signatures of what is currently rendered, so the 3s poll does not rebuild
@@ -173,8 +175,11 @@
 
   function setStatus(stateName) {
     const dot = $('statusDot');
-    dot.className = 'status-dot' + (stateName === 'ok' ? ' ok' : stateName === 'bad' ? ' bad' : '');
-    dot.title = stateName === 'ok' ? 'Mail service connected' : stateName === 'bad' ? 'Mail service unreachable' : 'Connecting…';
+    dot.className = 'status-dot' + (stateName === 'ok' ? ' ok' : stateName === 'bad' ? ' bad' : stateName === 'busy' ? ' busy' : '');
+    dot.title = stateName === 'ok' ? 'Mail service connected'
+      : stateName === 'bad' ? 'Mail service unreachable'
+      : stateName === 'busy' ? 'Rate limited — retrying shortly'
+      : 'Connecting…';
   }
 
   function beep() {
@@ -233,6 +238,20 @@
     };
   }
 
+  /** Provider tokens expire (mail.tm: ~1 hour). Renew it from the stored password. */
+  async function refreshToken(box) {
+    if (!box || !box.password) return null;
+    try {
+      const t = await api('/token', { method: 'POST', body: { address: box.address, password: box.password } });
+      if (t && t.token) {
+        box.token = t.token;
+        save();
+        return t.token;
+      }
+    } catch (_) { /* fall through — caller keeps the original error */ }
+    return null;
+  }
+
   async function pull(box, { announce = true } = {}) {
     let data;
     try {
@@ -240,15 +259,9 @@
     } catch (err) {
       // Token expired or was invalidated -> refresh it with the stored password, retry once.
       if ((err.status === 401 || err.status === 404) && box.password) {
-        try {
-          const t = await api('/token', { method: 'POST', body: { address: box.address, password: box.password } });
-          if (!t.token) throw err;
-          box.token = t.token;
-          save();
-          data = await api('/messages?page=1', { token: box.token });
-        } catch (_) {
-          throw err;
-        }
+        const fresh = await refreshToken(box);
+        if (!fresh) throw err;
+        data = await api('/messages?page=1', { token: box.token });
       } else {
         throw err;
       }
@@ -306,7 +319,20 @@
     renderReader(m);
 
     try {
-      const full = await api(`/messages/${id}`, { token: box.token });
+      let full;
+      try {
+        full = await api(`/messages/${id}`, { token: box.token });
+      } catch (err) {
+        // The token may have expired since the list was loaded — renew and retry once
+        // so the reader never gets stuck on the preview line.
+        if ((err.status === 401 || err.status === 404) && box.password) {
+          const fresh = await refreshToken(box);
+          if (!fresh) throw err;
+          full = await api(`/messages/${id}`, { token: box.token });
+        } else {
+          throw err;
+        }
+      }
       const detail = normalizeMessage(full);
       const idx = box.messages.findIndex((x) => x.id === id);
       if (idx >= 0) {
@@ -681,6 +707,9 @@
   /* ── polling ─────────────────────────────────────────────── */
   async function tick() {
     if (!state.auto || state.busy || document.hidden) return;
+    // The provider throttles bursts (HTTP 429). Stay quiet for a while instead
+    // of hammering it every 3 seconds.
+    if (Date.now() < state.backoffUntil) return;
     state.busy = true;
     try {
       if (!state.boxes.length) {
@@ -711,7 +740,14 @@
         renderSidebar();
       }
     } catch (err) {
-      setStatus('bad');
+      if (err && err.status === 429) {
+        // Provider is throttling us — back off instead of retrying every 3s.
+        state.backoffUntil = Date.now() + RATE_LIMIT_BACKOFF_MS;
+        setStatus('busy');
+        toast('Mail service is rate limiting us — retrying shortly', 'err');
+      } else {
+        setStatus('bad');
+      }
     } finally {
       state.busy = false;
     }

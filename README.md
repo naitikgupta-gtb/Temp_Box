@@ -1,7 +1,7 @@
 # TempBox — Temporary Email Inbox
 
 A disposable-email web app: generate an address, copy it, and watch the inbox update live.
-Zero npm dependencies — plain Node.js HTTP server + vanilla frontend.
+Vanilla frontend (no bundler, no build step) on a small Express server — one npm dependency.
 
 ```
 ┌──────────────────────────────────────────────┐
@@ -22,6 +22,7 @@ Zero npm dependencies — plain Node.js HTTP server + vanilla frontend.
 ## Run it
 
 ```bash
+npm install                # one dependency: express
 node server.js
 # → http://localhost:4599
 ```
@@ -32,7 +33,7 @@ node server.js
 PORT=8080 node server.js          # PowerShell: $env:PORT=8080; node server.js
 ```
 
-There is no build step and no `npm install` — `npm start` is an alias for `node server.js`.
+There is no build step and no bundler — `npm start` is an alias for `node server.js`.
 
 ## The `@gmail.com` look
 
@@ -133,7 +134,7 @@ mail servers block outbound port 25, in which case this step fails while everyth
 ## Project layout
 
 ```
-server.js                  zero-dependency HTTP server + provider proxy
+server.js                  Express server: static host + provider proxy
 public/index.html          markup
 public/styles.css          theme, layout, responsive rules
 public/app.js              app logic (state, polling, rendering, events)
@@ -141,6 +142,20 @@ scripts/mock-provider.js   offline mail.tm-shaped provider
 scripts/selftest.js        create mailbox → read back → delete
 scripts/send-test-mail.js  SMTP self-test helper
 ```
+
+## Deploying
+
+Any Node host works — the app is a plain `npm start` process that listens on `$PORT` and binds
+`0.0.0.0`. Set `MAIL_API_BASE` to point at a different provider, or leave it for mail.tm.
+
+```
+Build command : (none)
+Start command : npm start
+Port          : supplied by the platform via $PORT
+```
+
+Because the provider does not allow browser CORS calls, the **server must stay in front of the
+frontend** — a static-only host cannot serve this app as-is.
 
 ## Notes & limits
 
@@ -150,3 +165,7 @@ scripts/send-test-mail.js  SMTP self-test helper
 - The provider rotates its own domains over time. An address keeps the domain it was created with;
   the dropdown always shows the domains that are live *right now*.
 - Raw SMTP sending (self-test) can be blocked or throttled by the receiving MX / your network.
+- Provider access tokens expire (mail.tm: about an hour). The app renews them automatically from the
+  stored mailbox password, so a tab left open keeps working.
+- The provider throttles bursts and answers `429 Too Many Requests`. When that happens the poll backs
+  off for 30 seconds and the status dot turns amber instead of hammering the API.

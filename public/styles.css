@@ -91,6 +91,7 @@ body {
 .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--txt-faint); box-shadow: 0 0 0 4px rgba(255,255,255,0.04); transition: background .25s; }
 .status-dot.ok { background: var(--accent-3); box-shadow: 0 0 0 4px rgba(52, 211, 153, 0.16); }
 .status-dot.bad { background: var(--danger); box-shadow: 0 0 0 4px rgba(251, 113, 133, 0.16); }
+.status-dot.busy { background: #fbbf24; box-shadow: 0 0 0 4px rgba(251, 191, 36, 0.16); }
 
 .icon-btn {
   display: grid; place-items: center; width: 36px; height: 36px;
