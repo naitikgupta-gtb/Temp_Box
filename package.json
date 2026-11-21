@@ -1,0 +1,14 @@
+{
+  "name": "temp-mail-web",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Temporary email address web app with a live inbox (mail.tm backend).",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

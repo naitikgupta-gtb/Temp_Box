@@ -1,0 +1,13 @@
+node_modules/
+.env
+.env.*
+server.log
+server.err
+*.log
+*.err
+.port
+.e2e.json
+*.local
+.DS_Store
+tempbox.zip
+preview-*.jpg
