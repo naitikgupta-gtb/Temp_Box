@@ -24,10 +24,15 @@ Vanilla frontend (no bundler, no build step) on a small Express server — one n
 ```bash
 npm install                # one dependency: express
 node server.js
-# → http://localhost:4599
+# → http://localhost:3000  and  http://localhost:4599
 ```
 
-`PORT` and `HOST` can be overridden:
+With no `PORT` set the server listens on **3000** (the port container platforms
+like Deplox/Render/Fly forward to) **and 4599** (the local default), so the same
+checkout works locally and in a container. If `PORT` is set, only that port is
+opened.
+
+`HOST` can be overridden too:
 
 ```bash
 PORT=8080 node server.js          # PowerShell: $env:PORT=8080; node server.js
@@ -145,14 +150,17 @@ scripts/send-test-mail.js  SMTP self-test helper
 
 ## Deploying
 
-Any Node host works — the app is a plain `npm start` process that listens on `$PORT` and binds
-`0.0.0.0`. Set `MAIL_API_BASE` to point at a different provider, or leave it for mail.tm.
+Any Node host works — the app is a plain `npm start` process that binds `0.0.0.0`. Set
+`MAIL_API_BASE` to point at a different provider, or leave it for mail.tm.
 
 ```
 Build command : (none)
 Start command : npm start
-Port          : supplied by the platform via $PORT
+Port          : 3000 by default; 4599 is opened as an alias when $PORT is unset
 ```
+
+If the platform *does* set `$PORT`, the server listens on that port only. `GET /health` and
+`GET /api/health` both return `{"ok":true,...}` for platform health checks.
 
 Because the provider does not allow browser CORS calls, the **server must stay in front of the
 frontend** — a static-only host cannot serve this app as-is.

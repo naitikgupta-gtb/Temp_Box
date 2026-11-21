@@ -9,7 +9,8 @@
  * be blocked).
  *
  * Env:
- *   PORT          default 4599
+ *   PORT          explicit port; when unset the server listens on 3000
+ *                 (container default) and 4599 (local default)
  *   HOST          default 0.0.0.0
  *   MAIL_API_BASE default https://api.mail.tm
  */
@@ -18,10 +19,15 @@ const express = require('express');
 const path = require('path');
 const { URL } = require('url');
 
-const PORT = Number(process.env.PORT || 4599);
 const HOST = process.env.HOST || '0.0.0.0';
 const API_BASE = (process.env.MAIL_API_BASE || 'https://api.mail.tm').replace(/\/+$/, '');
 const PUBLIC_DIR = path.join(__dirname, 'public');
+
+// Container platforms (Deplox, Render, Fly, Heroku…) forward traffic to a fixed
+// container port and often do not set PORT, so the app has to listen on 3000.
+// Locally we prefer 4599, and we open both so neither setup is a dead end.
+const EXPLICIT_PORT = Number(process.env.PORT || 0);
+const PORTS = EXPLICIT_PORT ? [EXPLICIT_PORT] : [3000, 4599];
 
 // Never let a stalled provider hold a browser request open forever.
 const UPSTREAM_TIMEOUT_MS = 20000;
@@ -45,6 +51,15 @@ app.disable('etag');
 app.use(express.json({ limit: '1mb' }));
 
 app.get('/api/health', (req, res) => {
+  res.set('Cache-Control', 'no-store').json({
+    ok: true,
+    provider: API_BASE,
+    time: new Date().toISOString(),
+  });
+});
+
+// Some platforms health-check /health instead of /api/health.
+app.get('/health', (req, res) => {
   res.set('Cache-Control', 'no-store').json({
     ok: true,
     provider: API_BASE,
@@ -133,17 +148,52 @@ app.use(express.static(PUBLIC_DIR, {
   setHeaders: (res) => res.set('Cache-Control', 'no-cache'),
 }));
 
-const server = app.listen(PORT, HOST, () => {
-  console.log(`Temp Mail running on http://localhost:${PORT}`);
-  console.log(`Mail provider: ${API_BASE}`);
-});
+// Bind the first free port from PORTS and keep any alias ports alive too.
+// Container platforms (Deplox, Render, Fly, Heroku…) forward to a fixed
+// container port and frequently do not set PORT, so 3000 has to be open.
+const listeners = [];
+let lastError = null;
 
-server.on('error', (err) => {
-  if (err.code === 'EADDRINUSE' || err.code === 'EACCES') {
-    console.error(`\n  Port ${PORT} is not available (${err.code}).`);
-    console.error(`  Start on another port, for example:  PORT=4600 node server.js\n`);
-  } else {
-    console.error('Server error:', err.message);
+function tryListen(port) {
+  return new Promise((resolve) => {
+    const srv = app.listen(port, HOST);
+
+    const onError = (err) => {
+      srv.removeListener('listening', onListening);
+      if (err.code === 'EADDRINUSE' || err.code === 'EACCES') {
+        console.error(`  Port ${port} is not available (${err.code}), trying next...`);
+        lastError = err;
+        resolve(false);
+        return;
+      }
+      console.error('Server error:', err.message);
+      process.exit(1);
+    };
+
+    const onListening = () => {
+      srv.removeListener('error', onError);
+      srv.on('error', (err) => console.error('Server error:', err.message));
+      console.log(`Temp Mail running on http://localhost:${port}`);
+      listeners.push(srv);
+      resolve(true);
+    };
+
+    srv.once('error', onError);
+    srv.once('listening', onListening);
+  });
+}
+
+(async () => {
+  for (const port of PORTS) {
+    await tryListen(port);
   }
-  process.exit(1);
-});
+
+  console.log(`Mail provider: ${API_BASE}`);
+
+  if (!listeners.length) {
+    console.error('\n  Could not bind any port.');
+    console.error(`  Start on another port, for example:  PORT=4600 node server.js\n`);
+    if (lastError) console.error(`  Last error: ${lastError.code || lastError.message}\n`);
+    process.exit(1);
+  }
+})();
