@@ -772,7 +772,7 @@
         btn.classList.add('done');
         btn.querySelector('span').textContent = 'Copied';
         setTimeout(() => { btn.classList.remove('done'); btn.querySelector('span').textContent = 'Copy'; }, 1600);
-        toast('Copied: ' + box.address, 'ok');
+        toast('Copied real address: ' + box.address, 'ok');
       }
     });
 
@@ -785,7 +785,9 @@
         btn.classList.add('done');
         setTimeout(() => btn.classList.remove('done'), 1600);
         if (shown !== box.address) {
-          toast('Copied: ' + shown + ' — note: mail is delivered to ' + box.address, '');
+          // This button copies the look, not a working address — say so loudly
+          // so nobody waits for mail that can never arrive.
+          toast('Copied the look only — mail does NOT arrive here. Real inbox: ' + box.address, 'err');
         } else {
           toast('Copied: ' + shown, 'ok');
         }
