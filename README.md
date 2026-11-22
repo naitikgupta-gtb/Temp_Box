@@ -104,7 +104,16 @@ serves it to the browser:
 | Response header | Meaning |
 |---|---|
 | `X-TempBox-Cache: hit` | served from the server cache, no provider call |
-| `X-TempBox-Cache: stale` | provider returned an error, last good copy served instead (up to 90 s old) |
+| `X-TempBox-Cache: stale` | provider returned an error, last good copy served instead (up to 45 s old) |
+
+A stale copy is only served when it actually contains mail. An **empty** stale list is never
+returned — that would show an empty inbox even though the message has arrived — so the throttle is
+passed through to the browser and the inbox says it is rate limited.
+
+A throttled read is retried twice (600 ms, 1800 ms) before giving up, because the provider's limit
+is burst based and a short pause usually clears it.
+
+Sending `X-TempBox-Fresh: 1` skips the cache — that is what the manual refresh button uses.
 
 Account creation, token exchange and deletes are **never** cached. The cache key is the mailbox's
 bearer token, so one mailbox can never see another's mail.

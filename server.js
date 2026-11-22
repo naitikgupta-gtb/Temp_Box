@@ -101,7 +101,7 @@ app.get('/api/domains', async (req, res) => {
 // provider is already throttling.
 const LIST_TTL_MS = 6000;
 const DETAIL_TTL_MS = 30000;
-const STALE_MAX_MS = 90000;
+const STALE_MAX_MS = 45000;
 const CACHE_MAX = 300;
 // The provider throttles bursts, so a short pause usually clears the limit.
 const UPSTREAM_429_RETRIES = 2;
@@ -122,7 +122,18 @@ function cacheSet(key, status, body) {
     const oldest = msgCache.keys().next().value;
     if (oldest !== undefined) msgCache.delete(oldest);
   }
-  msgCache.set(key, { at: Date.now(), status, body });
+  // Remember whether this copy actually holds something: an empty stale list
+  // is worse than an honest error, because the inbox would look empty even
+  // though the mail has already arrived.
+  let hasItems = true;
+  try {
+    const parsed = JSON.parse(body);
+    const members = parsed['hydra:member'];
+    if (Array.isArray(members)) hasItems = members.length > 0;
+  } catch (_) {
+    hasItems = true; // not a list -> treat it as content
+  }
+  msgCache.set(key, { at: Date.now(), status, body, hasItems });
 }
 
 app.use('/api', async (req, res) => {
@@ -155,8 +166,10 @@ app.use('/api', async (req, res) => {
   const isDetail = /^\/messages\/[A-Za-z0-9]+$/.test(upstreamPath);
   const cacheable = req.method === 'GET' && (isList || isDetail);
   const ttl = isDetail ? DETAIL_TTL_MS : LIST_TTL_MS;
+  // An explicit refresh from the user must not be answered from the cache.
+  const forceFresh = req.headers['x-tempbox-fresh'] === '1';
   const key = cacheable ? cacheKeyFor(upstreamPath, query, req) : null;
-  const cached = key ? cacheGet(key) : null;
+  const cached = key && !forceFresh ? cacheGet(key) : null;
 
   if (cached && Date.now() - cached.at < ttl) {
     res
@@ -170,6 +183,10 @@ app.use('/api', async (req, res) => {
 
   const sendStale = (reason) => {
     if (!cached || Date.now() - cached.at > STALE_MAX_MS) return false;
+    // Never answer with an empty list: the client would keep showing an empty
+    // inbox even though the mail is sitting in the provider. Let it see the
+    // throttle instead and retry.
+    if (!cached.hasItems) return false;
     res
       .status(200)
       .set('Cache-Control', 'no-store')

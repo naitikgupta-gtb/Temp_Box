@@ -28,6 +28,7 @@
     tickCount: 0,
     busy: false,
     backoffUntil: 0,
+    forceFresh: false,
   };
 
   // Signatures of what is currently rendered, so the 3s poll does not rebuild
@@ -78,10 +79,12 @@
   const API_TIMEOUT_MS = 15000;
 
   async function api(path, opts = {}) {
-    const { method = 'GET', body = null, token = null } = opts;
+    const { method = 'GET', body = null, token = null, fresh = false } = opts;
     const headers = {};
     if (body) headers['Content-Type'] = 'application/json';
     if (token) headers.Authorization = 'Bearer ' + token;
+    // An explicit refresh must reach the provider instead of the server cache.
+    if (fresh) headers['X-TempBox-Fresh'] = '1';
 
     // A request that never comes back would leave the UI stuck on "loading…"
     // forever, so every call gets a deadline.
@@ -252,16 +255,16 @@
     return null;
   }
 
-  async function pull(box, { announce = true } = {}) {
+  async function pull(box, { announce = true, fresh = false } = {}) {
     let data;
     try {
-      data = await api('/messages?page=1', { token: box.token });
+      data = await api('/messages?page=1', { token: box.token, fresh });
     } catch (err) {
       // Token expired or was invalidated -> refresh it with the stored password, retry once.
       if ((err.status === 401 || err.status === 404) && box.password) {
-        const fresh = await refreshToken(box);
-        if (!fresh) throw err;
-        data = await api('/messages?page=1', { token: box.token });
+        const newToken = await refreshToken(box);
+        if (!newToken) throw err;
+        data = await api('/messages?page=1', { token: box.token, fresh });
       } else {
         throw err;
       }
@@ -291,14 +294,14 @@
 
     const known = box.knownIds || (box.knownIds = new Set());
     const isFirstSync = known.size === 0 && box.messages.length === 0;
-    const fresh = list.filter((m) => !known.has(m.id));
+    const newMessages = list.filter((m) => !known.has(m.id));
 
     list.forEach((m) => known.add(m.id));
     box.messages = list;
     box.unread = list.filter((m) => !m.seen).length;
 
-    if (announce && !isFirstSync && fresh.length) {
-      toast(`${fresh.length} new mail${fresh.length > 1 ? 's' : ''} received`, 'ok');
+    if (announce && !isFirstSync && newMessages.length) {
+      toast(`${newMessages.length} new mail${newMessages.length > 1 ? 's' : ''} received`, 'ok');
       beep();
     }
     return fresh;
@@ -726,7 +729,9 @@
       }
       const box = activeBox();
       if (box) {
-        await pull(box);
+        const forceFresh = state.forceFresh;
+        state.forceFresh = false;
+        await pull(box, { fresh: forceFresh });
         renderAll();
         setStatus('ok');
         // Keep the open message loaded (also re-opens it after a reload or in
@@ -863,7 +868,7 @@
       if (m) renderReader(m);
     });
 
-    $('refreshBtn').addEventListener('click', () => tick());
+    $('refreshBtn').addEventListener('click', () => { state.forceFresh = true; tick(); });
     // Another tab of this app can open a message — follow along.
     window.addEventListener('storage', (e) => {
       if (e.key !== STORE_KEY || !e.newValue) return;
@@ -915,7 +920,7 @@
       if (typing || e.metaKey || e.ctrlKey || e.altKey) return;
       if (e.key === 'c') { e.preventDefault(); $('copyBtn').click(); }
       else if (e.key === 'n') { e.preventDefault(); $('newAddrBtn').click(); }
-      else if (e.key === 'r') { e.preventDefault(); tick(); }
+      else if (e.key === 'r') { e.preventDefault(); state.forceFresh = true; tick(); }
       else if (e.key === 'Escape') { state.selectedId = null; renderAll(); }
     });
   }
