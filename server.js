@@ -103,6 +103,9 @@ const LIST_TTL_MS = 6000;
 const DETAIL_TTL_MS = 30000;
 const STALE_MAX_MS = 90000;
 const CACHE_MAX = 300;
+// The provider throttles bursts, so a short pause usually clears the limit.
+const UPSTREAM_429_RETRIES = 2;
+const UPSTREAM_429_DELAYS = [600, 1800];
 const msgCache = new Map();
 
 function cacheKeyFor(upstreamPath, query, req) {
@@ -178,23 +181,41 @@ app.use('/api', async (req, res) => {
   };
 
   try {
-    const upstream = await fetch(new URL(upstreamPath + query, API_BASE), {
-      method: req.method,
-      headers,
-      body,
-      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
-    });
-    const text = await upstream.text();
+    const url = new URL(upstreamPath + query, API_BASE);
+
+    // A 429 from the provider is worth one more try: the limiter is burst
+    // based, so waiting a moment usually gets the real answer through.
+    // Only reads are retried — replaying a POST could create a duplicate.
+    let upstream = null;
+    const attempts = cacheable ? UPSTREAM_429_RETRIES + 1 : 1;
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      if (attempt > 0) {
+        await new Promise((r) => setTimeout(r, UPSTREAM_429_DELAYS[attempt - 1] || 1000));
+      }
+      const res = await fetch(url, {
+        method: req.method,
+        headers,
+        body,
+        signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+      });
+      const text = await res.text();
+      upstream = { status: res.status, ok: res.ok, text };
+      if (res.status !== 429) break;
+    }
 
     if (cacheable && upstream.ok) {
-      cacheSet(key, upstream.status, text);
+      cacheSet(key, upstream.status, upstream.text);
     } else if (cacheable && !upstream.ok) {
       // The provider is throttling us — keep the UI working with the last
       // good copy instead of handing the browser an empty inbox.
       if (sendStale('upstream-' + upstream.status)) return;
     }
 
-    res.status(upstream.status).set('Cache-Control', 'no-store').type('application/json').send(text);
+    res
+      .status(upstream.status)
+      .set('Cache-Control', 'no-store')
+      .type('application/json')
+      .send(upstream.text);
   } catch (err) {
     if (cacheable && sendStale('network-error')) return;
     res.status(502).json({

@@ -8,7 +8,7 @@
   const STORE_KEY = 'tmpmail.state.v1';
   const POLL_MS = 3000;
   const IDLE_POLL_EVERY = 5; // poll other inboxes every Nth tick
-  const RATE_LIMIT_BACKOFF_MS = 30000; // pause polling after an HTTP 429
+  const RATE_LIMIT_BACKOFF_MS = 12000; // pause polling after an HTTP 429
 
   const $ = (id) => document.getElementById(id);
 
@@ -556,15 +556,21 @@
 
     // Skip the DOM rebuild when nothing changed — polling runs every 3s and a
     // rebuild would reset the reader scroll and reload the HTML iframe.
-    const sig = q + '|' + items.map((m) => `${m.id}:${m.seen}:${m.subject}:${m.from}`).join('|');
+    const throttled = state.backoffUntil > Date.now();
+    const sig = q + '|' + (throttled ? 'rl' : '') + '|' +
+      items.map((m) => `${m.id}:${m.seen}:${m.subject}:${m.from}`).join('|');
     if (sig === lastListSig) return;
     lastListSig = sig;
     list.innerHTML = '';
 
     if (!items.length) {
-      list.innerHTML = `<li class="empty"><span class="spinner"></span><span>${
-        box.messages.length ? 'No mail matches your search.' : 'Waiting for the first message…'
-      }</span></li>`;
+      const wait = Math.max(1, Math.ceil((state.backoffUntil - Date.now()) / 1000));
+      // While the provider is throttling us the inbox looks empty even though
+      // the mail may already have arrived — say so instead of looking broken.
+      const note = throttled
+        ? `Mail service is rate limiting us — retrying in ${wait}s…`
+        : (box.messages.length ? 'No mail matches your search.' : 'Waiting for the first message…');
+      list.innerHTML = `<li class="empty"><span class="spinner"></span><span>${note}</span></li>`;
       return;
     }
 
