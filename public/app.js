@@ -750,6 +750,9 @@
         // Provider is throttling us — back off instead of retrying every 3s.
         state.backoffUntil = Date.now() + RATE_LIMIT_BACKOFF_MS;
         setStatus('busy');
+        // Re-render so the inbox says what is going on instead of looking
+        // empty while the mail is actually sitting in the provider.
+        renderList();
         toast('Mail service is rate limiting us — retrying shortly', 'err');
       } else {
         setStatus('bad');
