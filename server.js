@@ -92,6 +92,36 @@ app.get('/api/domains', async (req, res) => {
 });
 
 // Everything else under /api is proxied to the provider.
+//
+// The message endpoints are cached briefly on the server. On a shared host
+// (Deplox) every visitor talks to the provider from the same outbound IP, and
+// the provider throttles that IP hard — a 3s poll from the browser turned into
+// a 429 every few requests. A short TTL collapses those polls into one
+// upstream call, and a stale copy is served instead of a 429 when the
+// provider is already throttling.
+const LIST_TTL_MS = 6000;
+const DETAIL_TTL_MS = 30000;
+const STALE_MAX_MS = 90000;
+const CACHE_MAX = 300;
+const msgCache = new Map();
+
+function cacheKeyFor(upstreamPath, query, req) {
+  // The bearer token is the identity of a mailbox, so it is a safe cache key.
+  return `${upstreamPath}${query}|${req.headers.authorization || ''}`;
+}
+
+function cacheGet(key) {
+  return msgCache.get(key) || null;
+}
+
+function cacheSet(key, status, body) {
+  if (msgCache.size >= CACHE_MAX) {
+    const oldest = msgCache.keys().next().value;
+    if (oldest !== undefined) msgCache.delete(oldest);
+  }
+  msgCache.set(key, { at: Date.now(), status, body });
+}
+
 app.use('/api', async (req, res) => {
   const original = req.originalUrl || req.url; // e.g. /api/messages?page=1
   const q = original.indexOf('?');
@@ -117,6 +147,36 @@ app.use('/api', async (req, res) => {
     }
   }
 
+  // Only the read-only message endpoints are cached, never account mutations.
+  const isList = upstreamPath === '/messages';
+  const isDetail = /^\/messages\/[A-Za-z0-9]+$/.test(upstreamPath);
+  const cacheable = req.method === 'GET' && (isList || isDetail);
+  const ttl = isDetail ? DETAIL_TTL_MS : LIST_TTL_MS;
+  const key = cacheable ? cacheKeyFor(upstreamPath, query, req) : null;
+  const cached = key ? cacheGet(key) : null;
+
+  if (cached && Date.now() - cached.at < ttl) {
+    res
+      .status(cached.status)
+      .set('Cache-Control', 'no-store')
+      .set('X-TempBox-Cache', 'hit')
+      .type('application/json')
+      .send(cached.body);
+    return;
+  }
+
+  const sendStale = (reason) => {
+    if (!cached || Date.now() - cached.at > STALE_MAX_MS) return false;
+    res
+      .status(200)
+      .set('Cache-Control', 'no-store')
+      .set('X-TempBox-Cache', 'stale')
+      .set('X-TempBox-Cache-Reason', reason)
+      .type('application/json')
+      .send(cached.body);
+    return true;
+  };
+
   try {
     const upstream = await fetch(new URL(upstreamPath + query, API_BASE), {
       method: req.method,
@@ -125,8 +185,18 @@ app.use('/api', async (req, res) => {
       signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
     });
     const text = await upstream.text();
+
+    if (cacheable && upstream.ok) {
+      cacheSet(key, upstream.status, text);
+    } else if (cacheable && !upstream.ok) {
+      // The provider is throttling us — keep the UI working with the last
+      // good copy instead of handing the browser an empty inbox.
+      if (sendStale('upstream-' + upstream.status)) return;
+    }
+
     res.status(upstream.status).set('Cache-Control', 'no-store').type('application/json').send(text);
   } catch (err) {
+    if (cacheable && sendStale('network-error')) return;
     res.status(502).json({
       error: 'Cannot reach mail provider',
       detail: (err && err.message) || String(err),

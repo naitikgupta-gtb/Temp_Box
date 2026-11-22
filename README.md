@@ -88,9 +88,26 @@ Allowed upstream paths: `/domains`, `/token`, `/accounts`, `/accounts/:id`, `/me
 | `GET /domains` | available domains (cached 5 min server-side) |
 | `POST /accounts` | create a mailbox → account id |
 | `POST /token` | exchange address + password for a Bearer token |
-| `GET /messages` | list inbox |
-| `GET /messages/:id` | full message body (`text` + `html[]`) |
+| `GET /messages` | list inbox (cached 6 s server-side) |
+| `GET /messages/:id` | full message body (`text` + `html[]`) (cached 30 s server-side) |
 | `DELETE /messages/:id`, `DELETE /accounts/:id` | delete message / inbox |
+
+### Why the message list is cached
+
+The provider throttles per **outbound IP**. On a shared host (Deplox, and any cloud runner) every
+visitor reaches the provider from the same address, so a 3-second poll from the browser turned into
+`429 Too Many Requests` every few requests — the inbox would look empty while the mail had arrived.
+
+So the server keeps the last good copy of the message list for 6 s (message bodies for 30 s) and
+serves it to the browser:
+
+| Response header | Meaning |
+|---|---|
+| `X-TempBox-Cache: hit` | served from the server cache, no provider call |
+| `X-TempBox-Cache: stale` | provider returned an error, last good copy served instead (up to 90 s old) |
+
+Account creation, token exchange and deletes are **never** cached. The cache key is the mailbox's
+bearer token, so one mailbox can never see another's mail.
 
 ## Swapping the provider or domain
 
