@@ -265,6 +265,23 @@ node server.js
 # → http://localhost:4601
 ```
 
+### Testing Gmail mode without a Google account
+
+`scripts/fake-imap.js` is a local IMAP server that behaves like a Gmail mailbox for whichever
+account logs in — it holds three messages (one for `<account>+shop@gmail.com`, one for the account
+itself, one for a stranger) so alias filtering can be checked properly:
+
+```bash
+node scripts/fake-imap.js 4701
+$env:IMAP_HOST = "127.0.0.1"; $env:IMAP_PORT = "4701"; $env:IMAP_SECURE = "false"
+$env:PORT = 4611; node server.js
+# → http://localhost:4611
+```
+
+Open the **My Gmail** tab, enter any address (e.g. `you@gmail.com`) with any password, and connect.
+The aliases and the per-address inbox filtering then work exactly as they do against real Gmail —
+only the transport is local.
+
 ## End-to-end self-test
 
 `scripts/selftest.js` creates a mailbox against a running app and reads it back:
@@ -292,6 +309,7 @@ public/index.html          markup
 public/styles.css          theme, layout, responsive rules
 public/app.js              app logic (state, polling, rendering, events)
 scripts/mock-provider.js   offline mail.tm-shaped provider
+scripts/fake-imap.js       offline IMAP server for testing Gmail mode
 scripts/selftest.js        create mailbox → read back → delete
 scripts/send-test-mail.js  SMTP self-test helper
 ```
