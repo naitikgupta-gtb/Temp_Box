@@ -54,16 +54,39 @@
       </div>
     </div>
 
+    <div class="source-row">
+      <div class="seg" id="sourceSeg" role="tablist" aria-label="Inbox source">
+        <button type="button" class="seg-btn active" data-source="mailtm" role="tab">Disposable domain</button>
+        <button type="button" class="seg-btn" data-source="gmail" role="tab">My Gmail — real @gmail.com</button>
+      </div>
+      <span class="source-note" id="sourceNote">Fast, free, anonymous — but disposable domains get rejected by some sites.</span>
+      <button type="button" class="ghost-btn tiny-btn" id="gmailDisconnectBtn" hidden>Switch account</button>
+    </div>
+
+    <form class="gmail-panel" id="gmailPanel" hidden>
+      <div class="gmail-row">
+        <input id="gmailUser" type="email" placeholder="youraccount@gmail.com" autocomplete="username" spellcheck="false" />
+        <input id="gmailPass" type="password" placeholder="Google app password" autocomplete="current-password" />
+        <button type="submit" class="primary-btn small-btn" id="gmailConnectBtn">Connect Gmail</button>
+      </div>
+      <p class="hint" id="gmailHint">
+        Connect <b>one</b> Gmail account and TempBox mints real <b>@gmail.com</b> addresses off it — either your
+        address as-is, or unlimited aliases with the <b>+</b> trick (<code>you+shop@gmail.com</code>). Every inbox
+        lands here. The app password stays in this server's memory — never on disk, never in the browser.
+        Google Account → Security → 2-Step Verification → App passwords → “Mail”.
+      </p>
+    </form>
+
     <div class="addr-controls">
       <label class="field">
         <span>Name</span>
         <input id="localInput" type="text" spellcheck="false" autocomplete="off" placeholder="random" />
       </label>
-      <label class="field">
+      <label class="field" id="domainField">
         <span>Domain</span>
         <select id="domainSelect"></select>
       </label>
-      <label class="field">
+      <label class="field" id="showAsField">
         <span>Show as</span>
         <select id="displaySelect">
           <option value="gmail.com">@gmail.com</option>

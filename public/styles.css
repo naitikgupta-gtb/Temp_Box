@@ -34,6 +34,10 @@
 
 * { box-sizing: border-box; }
 
+/* Author `display` rules (.field, .copy-btn, …) beat the UA's [hidden] rule,
+   so anything toggled with el.hidden would stay visible. Force it. */
+[hidden] { display: none !important; }
+
 html, body { height: 100%; }
 
 body {
@@ -190,6 +194,38 @@ body {
 .primary-btn:hover { transform: translateY(-1px); filter: brightness(1.06); }
 .primary-btn:disabled { opacity: .55; cursor: progress; transform: none; }
 .hint { margin: 14px 22px 18px; font-size: 12.5px; color: var(--txt-faint); }
+
+/* ── source switch (disposable domain ↔ real @gmail.com) ─────── */
+.source-row {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  padding: 16px 22px 0;
+}
+.seg {
+  display: inline-flex; padding: 4px; gap: 4px; border-radius: 999px;
+  background: var(--panel-2); border: 1px solid var(--line);
+}
+.seg-btn {
+  border: none; background: transparent; color: var(--txt-dim); cursor: pointer;
+  font-family: inherit; font-size: 12.5px; font-weight: 600; padding: 7px 14px;
+  border-radius: 999px; transition: .18s ease; white-space: nowrap;
+}
+.seg-btn:hover { color: var(--txt); }
+.seg-btn.active {
+  color: #06121f; background: linear-gradient(120deg, var(--accent) 0%, var(--accent-2) 100%);
+  box-shadow: 0 6px 18px -10px rgba(103,232,249,.9);
+}
+.source-note { font-size: 12.5px; color: var(--txt-faint); flex: 1; min-width: 220px; }
+.source-row .tiny-btn { width: auto; flex: 0 0 auto; padding: 7px 12px; font-size: 12px; border-radius: 8px; white-space: nowrap; }
+
+.gmail-panel { margin: 14px 22px 0; padding: 14px; border: 1px dashed var(--line-strong); border-radius: var(--radius-sm); background: rgba(103,232,249,.04); }
+.gmail-row { display: flex; gap: 10px; flex-wrap: wrap; }
+.gmail-row input {
+  flex: 1; min-width: 210px; background: var(--panel-2); border: 1px solid var(--line); color: var(--txt);
+  border-radius: var(--radius-sm); padding: 10px 12px; font-size: 14px; font-family: inherit; outline: none; transition: .18s ease;
+}
+.gmail-row input:focus { border-color: rgba(103,232,249,.55); box-shadow: 0 0 0 3px rgba(103,232,249,.12); }
+.gmail-panel .hint { margin: 12px 0 0; }
+.gmail-panel .hint code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
 
 /* ── sidebar ────────────────────────────────────────────────── */
 .side-panel { min-height: 0; }

@@ -36,6 +36,10 @@
     lastError: null,
     consec429: 0,
     lastCheckAt: 0,
+    // Which backend the inbox reads from: a disposable domain (mail.tm) or
+    // real @gmail.com aliases minted off the user's own Gmail account.
+    source: 'mailtm',
+    gmail: { token: '', user: '', domain: '' },
   };
 
   // Signatures of what is currently rendered, so the 3s poll does not rebuild
@@ -52,6 +56,7 @@
         boxes: state.boxes.map((b) => ({
           id: b.id, address: b.address, password: b.password, token: b.token,
           createdAt: b.createdAt, knownIds: Array.from(b.knownIds || []),
+          provider: b.provider || 'mailtm', gmailToken: b.gmailToken || null,
         })),
         activeId: state.activeId,
         selectedId: state.selectedId,
@@ -59,6 +64,8 @@
         displayAs: state.displayAs,
         auto: state.auto,
         sound: state.sound,
+        source: state.source,
+        gmail: { token: state.gmail.token, user: state.gmail.user, domain: state.gmail.domain },
       }));
     } catch (_) { /* storage may be unavailable */ }
   }
@@ -79,6 +86,12 @@
       state.displayAs = data.displayAs || 'gmail.com';
       state.auto = data.auto !== false;
       state.sound = !!data.sound;
+      state.source = data.source === 'gmail' ? 'gmail' : 'mailtm';
+      if (data.gmail) {
+        state.gmail.token = data.gmail.token || '';
+        state.gmail.user = data.gmail.user || '';
+        state.gmail.domain = data.gmail.domain || '';
+      }
     } catch (_) { /* ignore corrupt state */ }
   }
 
@@ -264,14 +277,38 @@
 
   async function pull(box, { announce = true, fresh = false } = {}) {
     let data;
+    const isGmail = box.provider === 'gmail';
+    const listUrl = isGmail
+      ? '/gmail/messages?alias=' + encodeURIComponent(box.address)
+      : '/messages?page=1';
+    const listToken = isGmail ? (box.gmailToken || state.gmail.token) : box.token;
     try {
-      data = await api('/messages?page=1', { token: box.token, fresh });
+      data = await api(listUrl, { token: listToken, fresh });
     } catch (err) {
       // Token expired or was invalidated -> refresh it with the stored password, retry once.
+      if (isGmail) {
+        // The Gmail session died (server restart, or the app password changed).
+        // Re-login with the stored app password before giving up — dropping the
+        // token here would throw away the only way back in.
+        if (err.status === 401) {
+          const back = await restoreGmailSession();
+          if (!back) {
+            state.gmail.token = '';
+            save();
+            renderSource();
+            throw err;
+          }
+          const newToken = state.gmail.token;
+          state.boxes.forEach((b) => { if (b.provider === 'gmail') b.gmailToken = newToken; });
+          data = await api(listUrl, { token: newToken, fresh });
+        } else {
+          throw err;
+        }
+      }
       if ((err.status === 401 || err.status === 404) && box.password) {
         const newToken = await refreshToken(box);
         if (!newToken) throw err;
-        data = await api('/messages?page=1', { token: box.token, fresh });
+        data = await api(listUrl, { token: box.token, fresh });
       } else {
         throw err;
       }
@@ -335,15 +372,18 @@
 
     try {
       let full;
+      const isGmail = box.provider === 'gmail';
+      const detailUrl = isGmail ? '/gmail/messages/' + id : '/messages/' + id;
+      const detailToken = isGmail ? (box.gmailToken || state.gmail.token) : box.token;
       try {
-        full = await api(`/messages/${id}`, { token: box.token });
+        full = await api(detailUrl, { token: detailToken });
       } catch (err) {
         // The token may have expired since the list was loaded — renew and retry once
         // so the reader never gets stuck on the preview line.
-        if ((err.status === 401 || err.status === 404) && box.password) {
+        if (!isGmail && (err.status === 401 || err.status === 404) && box.password) {
           const fresh = await refreshToken(box);
           if (!fresh) throw err;
-          full = await api(`/messages/${id}`, { token: box.token });
+          full = await api(detailUrl, { token: box.token });
         } else {
           throw err;
         }
@@ -353,8 +393,19 @@
       if (idx >= 0) {
         // Remember the list's version stamp so the next poll can tell whether
         // this body is still current.
-        const stamped = box.messages[idx].updatedAt || detail.updatedAt;
-        box.messages[idx] = { ...box.messages[idx], ...detail, seen: true, bodyUpdatedAt: stamped };
+        const prev = box.messages[idx];
+        const stamped = prev.updatedAt || detail.updatedAt;
+        const merged = { ...prev, ...detail, seen: true, bodyUpdatedAt: stamped };
+        // A detail payload that only carries the body must never wipe the
+        // sender, subject or intro that the list already knows.
+        if (!detail.from || detail.from === 'unknown') merged.from = prev.from;
+        if (!detail.fromName) merged.fromName = prev.fromName;
+        if (!detail.subject || detail.subject === '(no subject)') merged.subject = prev.subject;
+        if (!detail.intro) merged.intro = prev.intro;
+        if (!detail.to) merged.to = prev.to;
+        if (!detail.createdAt) merged.createdAt = prev.createdAt;
+        if (!detail.updatedAt) merged.updatedAt = prev.updatedAt;
+        box.messages[idx] = merged;
       }
       // Fall back to the freshly fetched detail if the list does not know
       // this message (yet) — the reader should never stay blank.
@@ -388,7 +439,161 @@
     }
   }
 
+  /* ── Gmail mode ───────────────────────────────────────────── */
+  /**
+   * Mint a real @gmail.com address off the connected Gmail account.
+   * An empty tag uses the account address itself; a tag creates an alias
+   * with Gmail's plus-addressing rule (you+shop@gmail.com).
+   */
+  function gmailAliasFor(tag) {
+    const user = (state.gmail.user || '').toLowerCase();
+    const base = user.split('@')[0];
+    const domain = state.gmail.domain || user.split('@')[1] || 'gmail.com';
+    if (!base) return '';
+    const clean = String(tag || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (!clean) return base + '@' + domain;
+    // Gmail caps the local part at 64 characters.
+    const room = Math.max(1, 64 - base.length - 1);
+    return `${base}+${clean.slice(0, room)}@${domain}`;
+  }
+
+  async function createGmailBox(tag) {
+    if (!state.gmail.token) throw new Error('Connect your Gmail account first');
+    const address = gmailAliasFor(tag);
+    if (!address) throw new Error('Gmail is not connected');
+    const box = {
+      id: 'gmail:' + address,
+      address,
+      provider: 'gmail',
+      gmailToken: state.gmail.token,
+      password: null,
+      token: null,
+      createdAt: Date.now(),
+      messages: [],
+      knownIds: new Set(),
+      unread: 0,
+    };
+    state.boxes.unshift(box);
+    state.activeId = box.id;
+    state.selectedId = null;
+    save();
+    await pull(box, { announce: false });
+    renderAll();
+    toast('New address ready: ' + address, 'ok');
+    return box;
+  }
+
+  async function connectGmail(user, password) {
+    const res = await api('/gmail/login', { method: 'POST', body: { user, password } });
+    state.gmail.token = res.token;
+    state.gmail.user = res.user;
+    state.gmail.domain = res.domain || 'gmail.com';
+    save();
+    // Keep the app password in sessionStorage only (gone when the tab closes)
+    // so a server restart can be recovered without asking again.
+    try { sessionStorage.setItem('tmpmail.gmailPass', password); } catch (_) { /* ignore */ }
+    renderSource();
+    return res;
+  }
+
+  /**
+   * Is the server still holding our Gmail session? Re-login if not.
+   *
+   * A saved token is only a shortcut: the stored app password can always mint
+   * a fresh one, even when the token itself was already dropped.
+   */
+  async function restoreGmailSession() {
+    if (state.gmail.token) {
+      try {
+        const res = await api('/gmail/session', { token: state.gmail.token });
+        if (res && res.ok) return true;
+      } catch (_) { /* server not reachable right now */ }
+    }
+    let pass = '';
+    try { pass = sessionStorage.getItem('tmpmail.gmailPass') || ''; } catch (_) { /* ignore */ }
+    if (pass && state.gmail.user) {
+      try {
+        const again = await api('/gmail/login', {
+          method: 'POST', body: { user: state.gmail.user, password: pass },
+        });
+        state.gmail.token = again.token;
+        state.gmail.user = again.user;
+        state.gmail.domain = again.domain;
+        save();
+        return true;
+      } catch (_) { /* fall through */ }
+    }
+    if (state.gmail.token) {
+      state.gmail.token = '';
+      save();
+    }
+    return false;
+  }
+
+  /**
+   * Forget the connected Gmail account: drop the server session, the app
+   * password and every alias minted off it, so another account can be used.
+   */
+  async function disconnectGmail() {
+    const token = state.gmail.token;
+    if (token) {
+      try { await api('/gmail/logout', { method: 'POST', token }); } catch (_) { /* already gone */ }
+    }
+    state.gmail = { token: '', user: '', domain: '' };
+    state.boxes = state.boxes.filter((b) => b.provider !== 'gmail');
+    if (!state.boxes.some((b) => b.id === state.activeId)) {
+      state.activeId = state.boxes.length ? state.boxes[0].id : null;
+    }
+    state.selectedId = null;
+    try { sessionStorage.removeItem('tmpmail.gmailPass'); } catch (_) { /* ignore */ }
+    save();
+    renderSource();
+    renderAll();
+    toast('Gmail disconnected', 'ok');
+  }
+
+  function renderSource() {
+    const gmail = state.source === 'gmail';
+    $('sourceSeg').querySelectorAll('.seg-btn').forEach((btn) => {
+      btn.classList.toggle('active', btn.dataset.source === state.source);
+    });
+    const connected = gmail && !!state.gmail.token;
+    $('gmailPanel').hidden = !gmail || connected;
+    $('domainField').hidden = gmail;
+    $('showAsField').hidden = gmail;
+    $('copyShownBtn').hidden = gmail;
+    $('sourceNote').textContent = gmail
+      ? (connected
+        ? 'Connected as ' + state.gmail.user + ' — every address below is a real @gmail.com one.'
+        : 'Connect one Gmail account to mint real @gmail.com addresses.')
+      : 'Fast, free, anonymous — but disposable domains get rejected by some sites.';
+    $('localInput').placeholder = gmail ? 'alias tag (optional)' : 'random';
+    $('newAddrBtn').disabled = gmail && !connected;
+    $('gmailDisconnectBtn').hidden = !connected;
+    if (gmail && state.gmail.user) $('gmailUser').value = state.gmail.user;
+  }
+
+  async function setSource(src) {
+    state.source = src === 'gmail' ? 'gmail' : 'mailtm';
+    save();
+    renderSource();
+    if (state.source === 'gmail') {
+      await restoreGmailSession();
+      renderSource();
+      if (state.gmail.token && !state.boxes.some((b) => b.provider === 'gmail')) {
+        try { await createBox($('localInput').value); } catch (err) { toast(err.message, 'err'); }
+      }
+    } else {
+      loadDomains();
+      if (!state.boxes.length) {
+        try { await createBox(genLocalPart(), state.domain); } catch (err) { toast(err.message, 'err'); }
+      }
+    }
+    renderAll();
+  }
+
   async function createBox(localPart, domain) {
+    if (state.source === 'gmail') return createGmailBox(localPart);
     const name = sanitizeLocal(localPart) || genLocalPart();
     const dom = domain || state.domain || state.domains[0];
     if (!dom) throw new Error('No mail domain available');
@@ -489,6 +694,9 @@
   /** The address as it is *shown* to the user (may be a look-alike domain). */
   function displayAddress(box) {
     if (!box) return '';
+    // A Gmail alias is already a real @gmail.com address — there is nothing
+    // to disguise and nothing to "unmask".
+    if (box.provider === 'gmail') return box.address;
     const local = box.address.split('@')[0];
     const domain = state.displayAs === 'real'
       ? box.address.split('@')[1]
@@ -503,7 +711,11 @@
 
     // Always keep the routable address visible when the display differs from it.
     const real = box ? box.address : '';
-    $('addrReal').textContent = (box && shown !== real) ? `delivers to ${real}` : '';
+    if (box && box.provider === 'gmail') {
+      $('addrReal').textContent = `real @gmail.com — delivered to ${state.gmail.user || 'your Gmail'}`;
+    } else {
+      $('addrReal').textContent = (box && shown !== real) ? `delivers to ${real}` : '';
+    }
 
     const pill = $('expiryPill');
     if (box) {
@@ -757,7 +969,10 @@
       if (!state.boxes.length) {
         // The provider may have been unreachable when the page loaded — try
         // again instead of leaving the app empty forever.
-        await createBox(genLocalPart(), state.domain);
+        // (In Gmail mode the user has to connect their account first.)
+        if (state.source !== 'gmail') {
+          await createBox(genLocalPart(), state.domain);
+        }
         return;
       }
       const box = activeBox();
@@ -820,6 +1035,40 @@
 
   /* ── events ──────────────────────────────────────────────── */
   function bind() {
+    $('sourceSeg').addEventListener('click', (e) => {
+      const btn = e.target.closest ? e.target.closest('.seg-btn') : null;
+      if (!btn || btn.dataset.source === state.source) return;
+      setSource(btn.dataset.source);
+    });
+
+    $('gmailPanel').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const btn = $('gmailConnectBtn');
+      const user = $('gmailUser').value.trim();
+      const pass = $('gmailPass').value.replace(/\s+/g, '');
+      if (!user || !pass) {
+        toast('Enter your Gmail address and the app password', 'err');
+        return;
+      }
+      btn.disabled = true;
+      try {
+        await connectGmail(user, pass);
+        $('gmailPass').value = '';
+        toast('Gmail connected: ' + state.gmail.user, 'ok');
+        if (!state.boxes.some((b) => b.provider === 'gmail')) {
+          await createBox($('localInput').value);
+        }
+      } catch (err) {
+        toast('Cannot connect Gmail: ' + err.message, 'err');
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    $('gmailDisconnectBtn').addEventListener('click', async () => {
+      await disconnectGmail();
+    });
+
     $('copyBtn').addEventListener('click', async () => {
       const box = activeBox();
       if (!box) return;
@@ -990,9 +1239,25 @@
     $('nextPoll').textContent = state.auto ? 'every 3s' : 'paused';
 
     bind();
+    renderSource();
     await loadDomains();
 
-    if (!state.boxes.length) {
+    if (state.source === 'gmail') {
+      // The Gmail session lives in the server's memory, so a restart means
+      // reconnecting — try the stored app password first.
+      await restoreGmailSession();
+      renderSource();
+      if (state.gmail.token && !state.boxes.length) {
+        try {
+          await createBox($('localInput').value);
+        } catch (err) {
+          toast('Setup failed: ' + err.message, 'err');
+        }
+      } else if (!state.boxes.length) {
+        $('addrText').textContent = 'connect your Gmail';
+        $('addrReal').textContent = 'then every address is a real @gmail.com one';
+      }
+    } else if (!state.boxes.length) {
       try {
         await createBox(genLocalPart(), state.domain);
       } catch (err) {

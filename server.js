@@ -18,6 +18,8 @@
 const express = require('express');
 const path = require('path');
 const { URL } = require('url');
+const crypto = require('crypto');
+const imap = require('./lib/imap');
 
 const HOST = process.env.HOST || '0.0.0.0';
 const API_BASE = (process.env.MAIL_API_BASE || 'https://api.mail.tm').replace(/\/+$/, '');
@@ -110,6 +112,181 @@ app.get('/api/domains', async (req, res) => {
   } catch (err) {
     res.status(502).json({
       error: 'Cannot reach mail provider',
+      detail: (err && err.message) || String(err),
+    });
+  }
+});
+
+// ── Gmail mode ────────────────────────────────────────────────────────────
+//
+// A disposable domain gets blocked by half the internet. A @gmail.com
+// address never does — because it is a real mailbox. Gmail lets one account
+// answer to many addresses (plus-addressing and the dot trick), so the user
+// connects ONE Gmail account here and the app mints aliases off it.
+//
+// The account password (a Gmail app password) is used by the server to open
+// an IMAP session. It is kept in this process's memory only — never written
+// to disk, never sent to the browser.
+const IMAP_HOST = process.env.IMAP_HOST || 'imap.gmail.com';
+const IMAP_PORT = Number(process.env.IMAP_PORT || 993);
+const IMAP_SECURE = process.env.IMAP_SECURE !== 'false';
+const gmailSessions = new Map(); // token -> { user, password, createdAt }
+const GMAIL_SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+
+function gmailSessionFor(req) {
+  const auth = req.headers.authorization || '';
+  const token = auth.replace(/^Bearer\s+/i, '').trim();
+  if (!token) return null;
+  const session = gmailSessions.get(token);
+  if (!session) return null;
+  if (Date.now() - session.createdAt > GMAIL_SESSION_TTL_MS) {
+    gmailSessions.delete(token);
+    return null;
+  }
+  return session;
+}
+
+/** mail.tm-shaped envelope so the frontend can reuse every code path. */
+function gmailEnvelope(entry) {
+  const from = imap.parseAddress(entry.headers.from || '');
+  const to = imap.parseAddressList(entry.headers.to || '');
+  const body = entry.message || { text: '', html: [] };
+  const plain = (body.text || '').trim();
+  const intro = plain
+    ? plain.replace(/\s+/g, ' ').slice(0, 140)
+    : (body.html && body.html[0] ? body.html[0].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 140) : '');
+  const date = entry.headers.date || '';
+  const createdAt = date ? new Date(date).toISOString() : new Date().toISOString();
+  return {
+    id: String(entry.uid),
+    from: { name: from.name, address: from.address },
+    to: to.length ? to : [{ address: '' }],
+    subject: entry.headers.subject || '(no subject)',
+    intro,
+    seen: false,
+    createdAt,
+    updatedAt: createdAt,
+    text: body.text || '',
+    html: body.html || [],
+  };
+}
+
+app.post('/api/gmail/login', async (req, res) => {
+  const user = String((req.body && req.body.user) || '').trim();
+  const password = String((req.body && req.body.password) || '').replace(/\s+/g, '');
+  if (!user || !user.includes('@')) {
+    res.status(400).json({ error: 'Enter the Gmail address of the account' });
+    return;
+  }
+  if (!password) {
+    res.status(400).json({ error: 'Enter the app password (Google Account → Security → App passwords)' });
+    return;
+  }
+  try {
+    // Prove the credentials work before handing out a session.
+    const conn = new imap.ImapConnection({ host: IMAP_HOST, port: IMAP_PORT, secure: IMAP_SECURE, user, password });
+    try {
+      await conn.connect();
+      await conn.login();
+    } finally {
+      conn.close();
+    }
+    const token = crypto.randomBytes(24).toString('hex');
+    gmailSessions.set(token, { user, password, createdAt: Date.now() });
+    res.status(200).set('Cache-Control', 'no-store').json({
+      token,
+      user,
+      host: IMAP_HOST,
+      // What the user can use as the address, e.g. name@gmail.com
+      domain: user.split('@')[1] || 'gmail.com',
+    });
+  } catch (err) {
+    res.status(502).json({
+      error: 'Cannot connect to Gmail',
+      detail: (err && err.message) || String(err),
+    });
+  }
+});
+
+app.post('/api/gmail/logout', (req, res) => {
+  const auth = req.headers.authorization || '';
+  const token = auth.replace(/^Bearer\s+/i, '').trim();
+  if (token) gmailSessions.delete(token);
+  res.status(200).set('Cache-Control', 'no-store').json({ ok: true });
+});
+
+app.get('/api/gmail/session', (req, res) => {
+  const session = gmailSessionFor(req);
+  res.status(200).set('Cache-Control', 'no-store').json(
+    session ? { ok: true, user: session.user, host: IMAP_HOST } : { ok: false }
+  );
+});
+
+app.get('/api/gmail/messages', async (req, res) => {
+  const session = gmailSessionFor(req);
+  if (!session) {
+    res.status(401).json({ error: 'Gmail is not connected — reconnect it' });
+    return;
+  }
+  const alias = String(req.query.alias || '').trim().toLowerCase();
+  if (!alias.includes('@')) {
+    res.status(400).json({ error: 'alias query parameter is required' });
+    return;
+  }
+  try {
+    const entries = await imap.readAliasMessages({
+      host: IMAP_HOST,
+      port: IMAP_PORT,
+      secure: IMAP_SECURE,
+      user: session.user,
+      password: session.password,
+      alias,
+    });
+    res.status(200).set('Cache-Control', 'no-store').json({
+      'hydra:member': entries.map(gmailEnvelope),
+      'hydra:totalItems': entries.length,
+    });
+  } catch (err) {
+    res.status(502).json({
+      error: 'Cannot read the Gmail inbox',
+      detail: (err && err.message) || String(err),
+    });
+  }
+});
+
+app.get('/api/gmail/messages/:uid', async (req, res) => {
+  const session = gmailSessionFor(req);
+  if (!session) {
+    res.status(401).json({ error: 'Gmail is not connected — reconnect it' });
+    return;
+  }
+  const uid = parseInt(req.params.uid, 10);
+  if (!Number.isFinite(uid)) {
+    res.status(400).json({ error: 'Bad message id' });
+    return;
+  }
+  try {
+    const parsed = await imap.readMessage({
+      host: IMAP_HOST,
+      port: IMAP_PORT,
+      secure: IMAP_SECURE,
+      user: session.user,
+      password: session.password,
+      uid,
+    });
+    // Return the *whole* message, exactly like the list envelope and like
+    // mail.tm's /messages/:id — a body-only payload would wipe the sender and
+    // the subject the list already knows.
+    res.status(200).set('Cache-Control', 'no-store').json(
+      gmailEnvelope({
+        uid,
+        headers: parsed.headers || {},
+        message: { text: parsed.text || '', html: parsed.html || [] },
+      })
+    );
+  } catch (err) {
+    res.status(502).json({
+      error: 'Cannot read that message',
       detail: (err && err.message) || String(err),
     });
   }

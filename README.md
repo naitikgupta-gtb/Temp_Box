@@ -6,17 +6,18 @@ Vanilla frontend (no bundler, no build step) on a small Express server — one n
 ```
 ┌──────────────────────────────────────────────┐
 │  TempBox UI (static, /public)               │
-│    address generator · inbox · reader        │
+│    source switch · address · inbox · reader  │
 └───────────────┬──────────────────────────────┘
                 │ same-origin fetch /api/*
 ┌───────────────▼──────────────────────────────┐
 │  Node server (server.js)                     │
 │  proxy + domain cache + static host          │
-└───────────────┬──────────────────────────────┘
-                │ HTTPS (Bearer token)
-┌───────────────▼──────────────────────────────┐
-│  mail.tm API  (accounts · messages)          │
-└──────────────────────────────────────────────┘
+└───────┬──────────────────────────┬───────────┘
+        │ HTTPS (Bearer token)      │ IMAP4rev1 (TLS 993)
+┌───────▼──────────────────┐  ┌────▼─────────────────────┐
+│  mail.tm API             │  │  imap.gmail.com           │
+│  (accounts · messages)   │  │  (your own Gmail account) │
+└──────────────────────────┘  └──────────────────────────┘
 ```
 
 ## Run it
@@ -56,6 +57,62 @@ A real `@gmail.com` mailbox cannot be handed out without a Google account, so th
   `@hotmail.com`, `@icloud.com`, `@proton.me`, `@zoho.com`, or **Real domain**.
 - The real address is never hidden — it stays visible under the big one the whole time.
 
+## Real `@gmail.com` addresses — the Gmail mode
+
+The display layer above fakes the *look* of a Gmail address. The **Gmail mode** is the real thing:
+switch the source to **“My Gmail — real @gmail.com”** and TempBox mints genuine addresses off a Gmail
+account you own.
+
+### Why it works
+
+Gmail ignores everything after a `+` in the local part and delivers that mail to the same inbox:
+
+```
+aze.131.989@gmail.com          ← your account
+aze.131.989+shop@gmail.com     ← same inbox, a different address
+aze.131.989+bank@gmail.com     ← same inbox, yet another address
+```
+
+So one Gmail account becomes an unlimited set of *distinct, real* `@gmail.com` addresses, all landing
+in the one inbox. This is the same trick Emailnator uses — their own FAQ says it outright: *“Gmail
+ignores dots … and everything after a `+` … Emailnator uses that to give you many different
+addresses.”*
+
+Each address gets its own inbox panel in TempBox. Mail is matched to an address by its recipient
+headers (`Delivered-To`, `X-Original-To`, `To`, `Cc`), so `+shop` only ever shows mail addressed to
+`+shop`, and the bare address only shows mail addressed to the bare address.
+
+### Setup (once, on your Google account)
+
+1. Open **Google Account → Security → 2-Step Verification** and turn it on.
+2. In the same page open **App passwords** and create one named “TempBox” for **Mail**.
+   Google gives you a 16-character password with spaces, e.g. `abcd efgh ijkl mnop`.
+3. In TempBox pick the **My Gmail** tab, enter the Gmail address and that app password, press
+   **Connect Gmail**.
+
+### What the app does with the password
+
+| Where | What is stored |
+|---|---|
+| Browser `sessionStorage` | the app password, so a server restart reconnects without asking again. Gone when the tab closes. |
+| Server memory | the app password, inside the session. **Never written to disk**, never logged, dropped when the session expires (12 h) or you press *Switch account*. |
+| Disk / Git | nothing. There is no `.env` file, no database, no credential in the repo. |
+
+The server needs the password because it opens the IMAP connection itself — the browser cannot do
+IMAP, and handing the password to the browser would mean handing it to the page. **Anyone who can
+reach your deployed TempBox instance can therefore open a Gmail session.** That is why a dedicated
+Google account is recommended, and why the app password should be revoked the moment you stop using
+the feature.
+
+### Requirements and limits
+
+- The deployment host must be able to reach `imap.gmail.com:993`. Some container platforms block
+  outbound IMAP — if the connection fails, the inbox says so instead of pretending to be empty.
+- Google requires an app password (2-Step Verification) — a normal account password will not work.
+- Aliases are limited by Gmail: the local part is capped at 64 characters.
+- One IMAP connection is opened per poll and closed again; nothing is left running.
+
+
 ## Why there is a backend proxy
 
 The mail provider does **not** send `Access-Control-Allow-Origin` headers, so a browser calling
@@ -66,6 +123,10 @@ Allowed upstream paths: `/domains`, `/token`, `/accounts`, `/accounts/:id`, `/me
 
 ## Features
 
+- **Two sources, one inbox UI** — a disposable domain, or real `@gmail.com` addresses off your own
+  Gmail account (see below).
+- **Unlimited real aliases** — `you+shop@gmail.com`, `you+bank@gmail.com`, … each with its own
+  inbox panel, all delivered to the one Gmail account.
 - **One-click address** — random readable local part (`glidefalcon659@maxxspace.com`), or type your own.
 - **Gmail-style display** — shows `@gmail.com` (or 6 other looks) while the real domain still delivers.
 - **Two copy buttons** — the working address, or the address exactly as displayed.
@@ -91,6 +152,16 @@ Allowed upstream paths: `/domains`, `/token`, `/accounts`, `/accounts/:id`, `/me
 | `GET /messages` | list inbox (cached 8 s server-side) |
 | `GET /messages/:id` | full message body (`text` + `html[]`) (cached 30 s server-side) |
 | `DELETE /messages/:id`, `DELETE /accounts/:id` | delete message / inbox |
+
+### TempBox's own API
+
+| Call | Purpose |
+|---|---|
+| `POST /api/gmail/login` | verify the app password over IMAP → session token |
+| `POST /api/gmail/logout` | drop the session (and the stored password) |
+| `GET /api/gmail/session` | is the session still alive? |
+| `GET /api/gmail/messages?alias=` | list the mail addressed to one alias |
+| `GET /api/gmail/messages/:uid` | full message (headers + body) |
 
 ### Why the message list is cached
 
@@ -162,6 +233,26 @@ Domains are read from the provider at runtime, so a new provider domain appears 
 automatically. For a **custom domain of your own**, add its MX records to the provider and it will
 show up in the same dropdown.
 
+### Why the dropdown often shows exactly one domain
+
+This is a property of the provider, not a bug in TempBox. `GET /domains` returns whatever domains the
+provider currently operates, and mail.tm currently answers with **one**: `euploading.com`
+(`hydra:totalItems: 1`). There is nothing to rotate between — the app shows every domain the provider
+offers, and that set is a single entry today.
+
+It is also why the Gmail mode exists. A shared disposable domain is on every blocklist there is, and
+the provider can retire it at any time, so an address built on it is a dead end for anything that
+checks the domain. Two durable answers:
+
+1. **Your own domain on the provider.** Add the domain to mail.tm with its MX records and it appears
+   in the same dropdown — you own it, so nobody can retire it.
+2. **Gmail mode.** A real `@gmail.com` address off your own account, which no site can blocklist.
+
+Sites like Emailnator look like they have many domains because they *own* many domains and point
+them all at their own mail server. Their `@gmail.com` option is not a different domain at all — it
+is the Gmail plus-alias trick described above, running on an account they operate for you. That is
+the part worth copying, and it is exactly what Gmail mode does with your own account.
+
 ## Offline development (mock provider)
 
 `scripts/mock-provider.js` is a local stand-in for mail.tm with the same REST shape and two seeded
@@ -196,6 +287,7 @@ mail servers block outbound port 25, in which case this step fails while everyth
 
 ```
 server.js                  Express server: static host + provider proxy
+lib/imap.js                IMAP4rev1 client + MIME parser (node:tls only, no dependency)
 public/index.html          markup
 public/styles.css          theme, layout, responsive rules
 public/app.js              app logic (state, polling, rendering, events)
@@ -203,6 +295,11 @@ scripts/mock-provider.js   offline mail.tm-shaped provider
 scripts/selftest.js        create mailbox → read back → delete
 scripts/send-test-mail.js  SMTP self-test helper
 ```
+
+`lib/imap.js` is written by hand against `node:tls` / `node:net` so that **Express stays the only
+dependency**. It speaks IMAP4rev1 (login, select, `UID SEARCH`, `UID FETCH`, literal-aware reads),
+parses MIME (multipart, base64, quoted-printable, charsets) and matches a message to an alias by its
+recipient headers.
 
 ## Deploying
 
@@ -234,3 +331,9 @@ frontend** — a static-only host cannot serve this app as-is.
 - The provider throttles bursts and answers `429 Too Many Requests`, and its edge can answer
   `403` with `error code: 1010` when it does not like the request signature. Both are retried, and
   the inbox says which one is happening instead of just looking empty.
+- **Gmail mode** hands your Google app password to the TempBox server, because the server is the one
+  that speaks IMAP. Use a dedicated Google account, and revoke the app password when you are done.
+- **Gmail mode** needs outbound IMAP (`imap.gmail.com:993`). A host that blocks it cannot use that
+  mode — the disposable mode keeps working.
+- Gmail mode shows the **real** address. There is no display/real split there, so “Copy” and
+  “Copy as shown” collapse into one button and the *Domain* / *Show as* fields are hidden.
