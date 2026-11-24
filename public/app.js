@@ -9,6 +9,8 @@
   const POLL_MS = 3000;
   const IDLE_POLL_EVERY = 5; // poll other inboxes every Nth tick
   const RATE_LIMIT_BACKOFF_MS = 12000; // pause polling after an HTTP 429
+  const MAX_BACKOFF_MS = 45000; // ... but not forever on a shared IP
+  const EMPTY_FORCE_FRESH_MS = 20000; // bypass the server cache after this long empty
 
   const $ = (id) => document.getElementById(id);
 
@@ -29,6 +31,11 @@
     busy: false,
     backoffUntil: 0,
     forceFresh: false,
+    // The last failed poll, so the inbox can say what went wrong instead of
+    // looking empty while the mail is actually sitting in the provider.
+    lastError: null,
+    consec429: 0,
+    lastCheckAt: 0,
   };
 
   // Signatures of what is currently rendered, so the 3s poll does not rebuild
@@ -299,6 +306,11 @@
     list.forEach((m) => known.add(m.id));
     box.messages = list;
     box.unread = list.filter((m) => !m.seen).length;
+    // Remember how long this inbox has been empty. The provider delivers the
+    // first mail to a brand-new address slowly (seconds to a few minutes), so
+    // after a while we stop trusting the server cache and ask the provider
+    // directly.
+    box.emptySince = list.length ? 0 : (box.emptySince || Date.now());
 
     if (announce && !isFirstSync && newMessages.length) {
       toast(`${newMessages.length} new mail${newMessages.length > 1 ? 's' : ''} received`, 'ok');
@@ -560,7 +572,12 @@
     // Skip the DOM rebuild when nothing changed — polling runs every 3s and a
     // rebuild would reset the reader scroll and reload the HTML iframe.
     const throttled = state.backoffUntil > Date.now();
-    const sig = q + '|' + (throttled ? 'rl' : '') + '|' +
+    const errStatus = state.lastError ? state.lastError.status : '';
+    // The waiting message counts up, so it has to be part of the signature —
+    // otherwise the DOM is never rebuilt and the counter stays frozen.
+    const waited = box.emptySince ? Math.floor((Date.now() - box.emptySince) / 10000) : 0;
+    const checkBucket = state.lastCheckAt ? Math.floor((Date.now() - state.lastCheckAt) / 10000) : 0;
+    const sig = q + '|' + (throttled ? 'rl' : '') + '|' + errStatus + '|' + waited + '|' + checkBucket + '|' +
       items.map((m) => `${m.id}:${m.seen}:${m.subject}:${m.from}`).join('|');
     if (sig === lastListSig) return;
     lastListSig = sig;
@@ -570,9 +587,25 @@
       const wait = Math.max(1, Math.ceil((state.backoffUntil - Date.now()) / 1000));
       // While the provider is throttling us the inbox looks empty even though
       // the mail may already have arrived — say so instead of looking broken.
-      const note = throttled
-        ? `Mail service is rate limiting us — retrying in ${wait}s…`
-        : (box.messages.length ? 'No mail matches your search.' : 'Waiting for the first message…');
+      let note;
+      if (throttled) {
+        note = `Mail service is rate limiting us — retrying in ${wait}s…`;
+      } else if (state.lastError) {
+        const why = state.lastError.status
+          ? `HTTP ${state.lastError.status}`
+          : 'no connection';
+        const ago = state.lastCheckAt ? Math.round((Date.now() - state.lastCheckAt) / 1000) : 0;
+        note = `Cannot reach the mail service (${why}). Last check ${ago}s ago — retrying automatically…`;
+      } else if (box.messages.length) {
+        note = 'No mail matches your search.';
+      } else {
+        // The first mail to a brand-new address regularly takes a minute or
+        // two to arrive, so say that instead of leaving a silent empty list.
+        const secs = box.emptySince ? Math.round((Date.now() - box.emptySince) / 1000) : 0;
+        note = secs < 20
+          ? 'Waiting for the first message…'
+          : `Waiting for the first message… (${secs}s so far — the first mail to a new address can take 1–3 minutes)`;
+      }
       list.innerHTML = `<li class="empty"><span class="spinner"></span><span>${note}</span></li>`;
       return;
     }
@@ -731,7 +764,13 @@
       if (box) {
         const forceFresh = state.forceFresh;
         state.forceFresh = false;
-        await pull(box, { fresh: forceFresh });
+        // An inbox that has been empty for a while may be hiding a message
+        // behind the server cache — ask the provider directly.
+        const staleEmpty = box.emptySince && (Date.now() - box.emptySince) > EMPTY_FORCE_FRESH_MS;
+        await pull(box, { fresh: forceFresh || staleEmpty });
+        state.lastError = null;
+        state.consec429 = 0;
+        state.lastCheckAt = Date.now();
         renderAll();
         setStatus('ok');
         // Keep the open message loaded (also re-opens it after a reload or in
@@ -751,16 +790,28 @@
         renderSidebar();
       }
     } catch (err) {
+      state.lastCheckAt = Date.now();
       if (err && err.status === 429) {
         // Provider is throttling us — back off instead of retrying every 3s.
-        state.backoffUntil = Date.now() + RATE_LIMIT_BACKOFF_MS;
+        // Repeated throttles mean we are on a shared, heavily used IP, so the
+        // pause grows instead of hammering the same limit.
+        state.consec429++;
+        const wait = Math.min(MAX_BACKOFF_MS, RATE_LIMIT_BACKOFF_MS * state.consec429);
+        state.backoffUntil = Date.now() + wait;
         setStatus('busy');
         // Re-render so the inbox says what is going on instead of looking
         // empty while the mail is actually sitting in the provider.
         renderList();
         toast('Mail service is rate limiting us — retrying shortly', 'err');
       } else {
+        // A blocked or unreachable provider is just as confusing as an empty
+        // inbox, so say it in the inbox itself.
+        state.lastError = {
+          status: (err && err.status) || 0,
+          message: (err && err.message) || 'service unreachable',
+        };
         setStatus('bad');
+        renderList();
       }
     } finally {
       state.busy = false;
@@ -959,6 +1010,13 @@
             state.boxes = state.boxes.filter((x) => x.id !== b.id);
             save();
             toast('Inbox ' + b.address + ' expired and was removed', 'err');
+          } else {
+            // Say what went wrong instead of showing a silent empty inbox.
+            state.lastError = {
+              status: (err && err.status) || 0,
+              message: (err && err.message) || 'service unreachable',
+            };
+            state.lastCheckAt = Date.now();
           }
         }
       }

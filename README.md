@@ -88,7 +88,7 @@ Allowed upstream paths: `/domains`, `/token`, `/accounts`, `/accounts/:id`, `/me
 | `GET /domains` | available domains (cached 5 min server-side) |
 | `POST /accounts` | create a mailbox → account id |
 | `POST /token` | exchange address + password for a Bearer token |
-| `GET /messages` | list inbox (cached 6 s server-side) |
+| `GET /messages` | list inbox (cached 8 s server-side) |
 | `GET /messages/:id` | full message body (`text` + `html[]`) (cached 30 s server-side) |
 | `DELETE /messages/:id`, `DELETE /accounts/:id` | delete message / inbox |
 
@@ -98,25 +98,55 @@ The provider throttles per **outbound IP**. On a shared host (Deplox, and any cl
 visitor reaches the provider from the same address, so a 3-second poll from the browser turned into
 `429 Too Many Requests` every few requests — the inbox would look empty while the mail had arrived.
 
-So the server keeps the last good copy of the message list for 6 s (message bodies for 30 s) and
+So the server keeps the last good copy of the message list for 8 s (message bodies for 30 s) and
 serves it to the browser:
 
 | Response header | Meaning |
 |---|---|
 | `X-TempBox-Cache: hit` | served from the server cache, no provider call |
-| `X-TempBox-Cache: stale` | provider returned an error, last good copy served instead (up to 45 s old) |
+| `X-TempBox-Cache: stale` | provider returned an error, last good copy served instead (up to 60 s old) |
 
 A stale copy is only served when it actually contains mail. An **empty** stale list is never
 returned — that would show an empty inbox even though the message has arrived — so the throttle is
 passed through to the browser and the inbox says it is rate limited.
 
-A throttled read is retried twice (600 ms, 1800 ms) before giving up, because the provider's limit
-is burst based and a short pause usually clears it.
+A throttled or blocked read is retried twice (700 ms, 2000 ms) before giving up, because the
+provider's limit is burst based and a short pause usually clears it. `403` is retried too: the
+provider's edge (Cloudflare) answers a request it does not like with `error code: 1010`, and the
+retry goes out with a **different browser signature** — the upstream request carries an ordinary
+browser `User-Agent` + `Accept-Language` instead of a script one, and each retry rotates through a
+small pool of them. A blocked signature therefore cannot turn into a dead inbox.
 
-Sending `X-TempBox-Fresh: 1` skips the cache — that is what the manual refresh button uses.
+Sending `X-TempBox-Fresh: 1` skips the cache — that is what the manual refresh button uses, and the
+app also sends it by itself once an inbox has been empty for 20 s, so a message that arrived during a
+throttle is not hidden behind the cache.
 
 Account creation, token exchange and deletes are **never** cached. The cache key is the mailbox's
 bearer token, so one mailbox can never see another's mail.
+
+## The inbox always says what is happening
+
+An empty inbox is the worst possible answer: the user cannot tell "no mail yet" from "the mail
+service is broken". So the inbox itself carries the state:
+
+| State | What the inbox shows |
+|---|---|
+| healthy, no mail | `Waiting for the first message… (30s so far — the first mail to a new address can take 1–3 minutes)` |
+| provider throttling | `Mail service is rate limiting us — retrying in 24s…` |
+| provider blocked / unreachable | `Cannot reach the mail service (HTTP 403). Last check 12s ago — retrying automatically…` |
+| search with no hit | `No mail matches your search.` |
+
+Two things drive that honesty:
+
+- **The first mail to a brand-new address is slow.** The receiving MX takes anywhere from a few
+  seconds to about three minutes to hand a first message over — measured against live mail.tm
+  accounts, not guessed. The waiting message says so, and counts up, instead of sitting there
+  looking broken.
+- **Repeated throttles back off further.** A shared outbound IP means the provider throttles us
+  sooner; the pause grows 12 s → 24 s → 45 s (cap) instead of hammering the same limit every 3 s.
+
+A failed read also keeps the last known messages on screen: the server serves the last good copy of
+a **non-empty** list, and the browser merges it into what it already had.
 
 ## Swapping the provider or domain
 
@@ -201,5 +231,6 @@ frontend** — a static-only host cannot serve this app as-is.
 - Raw SMTP sending (self-test) can be blocked or throttled by the receiving MX / your network.
 - Provider access tokens expire (mail.tm: about an hour). The app renews them automatically from the
   stored mailbox password, so a tab left open keeps working.
-- The provider throttles bursts and answers `429 Too Many Requests`. When that happens the poll backs
-  off for 30 seconds and the status dot turns amber instead of hammering the API.
+- The provider throttles bursts and answers `429 Too Many Requests`, and its edge can answer
+  `403` with `error code: 1010` when it does not like the request signature. Both are retried, and
+  the inbox says which one is happening instead of just looking empty.

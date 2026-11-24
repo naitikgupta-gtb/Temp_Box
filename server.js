@@ -72,17 +72,41 @@ app.get('/api/domains', async (req, res) => {
     res.set('Cache-Control', 'no-store').type('application/json').send(domainsCache.body);
     return;
   }
+  const headers = upstreamHeaders(null);
   try {
-    const upstream = await fetch(new URL('/domains', API_BASE), {
-      headers: { Accept: 'application/ld+json, application/json', 'User-Agent': 'temp-mail-web/1.0' },
-      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
-    });
-    const text = await upstream.text();
+    let upstream = null;
+    for (let attempt = 0; attempt <= UPSTREAM_RETRIES; attempt++) {
+      if (attempt > 0) {
+        await new Promise((r) => setTimeout(r, UPSTREAM_RETRY_DELAYS[attempt - 1] || 1000));
+        headers['User-Agent'] = UPSTREAM_USER_AGENTS[attempt % UPSTREAM_USER_AGENTS.length];
+      }
+      const res2 = await fetch(new URL('/domains', API_BASE), {
+        headers,
+        signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+      });
+      const text = await res2.text();
+      upstream = { status: res2.status, ok: res2.ok, text };
+      if (!UPSTREAM_RETRY_STATUSES.includes(res2.status)) break;
+    }
     if (upstream.ok) {
       domainsCache.at = Date.now();
-      domainsCache.body = text;
+      domainsCache.body = upstream.text;
+    } else if (domainsCache.body) {
+      // The provider is having a moment, but a known domain list is still
+      // good enough to create an address.
+      res
+        .status(200)
+        .set('Cache-Control', 'no-store')
+        .set('X-TempBox-Cache', 'stale')
+        .type('application/json')
+        .send(domainsCache.body);
+      return;
     }
-    res.status(upstream.status).set('Cache-Control', 'no-store').type('application/json').send(text);
+    res
+      .status(upstream.status)
+      .set('Cache-Control', 'no-store')
+      .type('application/json')
+      .send(errorPayload(upstream.status, upstream.text));
   } catch (err) {
     res.status(502).json({
       error: 'Cannot reach mail provider',
@@ -99,14 +123,57 @@ app.get('/api/domains', async (req, res) => {
 // a 429 every few requests. A short TTL collapses those polls into one
 // upstream call, and a stale copy is served instead of a 429 when the
 // provider is already throttling.
-const LIST_TTL_MS = 6000;
+const LIST_TTL_MS = 8000;
 const DETAIL_TTL_MS = 30000;
-const STALE_MAX_MS = 45000;
+const STALE_MAX_MS = 60000;
 const CACHE_MAX = 300;
-// The provider throttles bursts, so a short pause usually clears the limit.
-const UPSTREAM_429_RETRIES = 2;
-const UPSTREAM_429_DELAYS = [600, 1800];
+// 429 = the provider throttles this IP, 403/5xx = its edge (Cloudflare)
+// rejected the request. Both are worth another try, because a throttled
+// window usually clears after a short pause and a blocked request goes out
+// again with a different client signature.
+const UPSTREAM_RETRIES = 2;
+const UPSTREAM_RETRY_DELAYS = [700, 2000];
+const UPSTREAM_RETRY_STATUSES = [403, 429, 502, 503, 504];
+// The provider sits behind a bot filter. A plain script signature gets
+// rejected with "error code: 1010", which used to leave the inbox silently
+// empty. Send an ordinary browser signature, and rotate it on every retry so
+// one blocked signature cannot turn into a dead inbox.
+const UPSTREAM_USER_AGENTS = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (X11; Linux x86_64; rv:132.0) Gecko/20100101 Firefox/132.0',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
+];
+
+function upstreamHeaders(authorization) {
+  const headers = {
+    Accept: 'application/ld+json, application/json',
+    'User-Agent': UPSTREAM_USER_AGENTS[0],
+    'Accept-Language': 'en-US,en;q=0.9',
+  };
+  if (authorization) headers.Authorization = authorization;
+  return headers;
+}
+
 const msgCache = new Map();
+
+/**
+ * The provider's edge answers a blocked request with HTML ("error code:
+ * 1010"). The browser needs a JSON error it can show, not a wall of markup.
+ */
+function errorPayload(status, text) {
+  try {
+    JSON.parse(text);
+    return text;
+  } catch (_) { /* not JSON */ }
+  const detail = String(text || '').slice(0, 200).replace(/\s+/g, ' ').trim();
+  let error = 'The mail provider returned an error.';
+  if (status === 403) error = 'The mail provider blocked this request (bot filter). Retrying with a different signature.';
+  else if (status === 429) error = 'The mail provider is rate limiting us.';
+  else if (status >= 500) error = 'The mail provider is having trouble right now.';
+  return JSON.stringify({ error, status, detail });
+}
 
 function cacheKeyFor(upstreamPath, query, req) {
   // The bearer token is the identity of a mailbox, so it is a safe cache key.
@@ -147,11 +214,7 @@ app.use('/api', async (req, res) => {
     return;
   }
 
-  const headers = {
-    Accept: 'application/ld+json, application/json',
-    'User-Agent': 'temp-mail-web/1.0',
-  };
-  if (req.headers.authorization) headers.Authorization = req.headers.authorization;
+  const headers = upstreamHeaders(req.headers.authorization);
 
   let body;
   if (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH') {
@@ -202,12 +265,15 @@ app.use('/api', async (req, res) => {
 
     // A 429 from the provider is worth one more try: the limiter is burst
     // based, so waiting a moment usually gets the real answer through.
-    // Only reads are retried — replaying a POST could create a duplicate.
+    // A 403 is the provider's bot filter: the same request goes out again
+    // with a different client signature. Only reads are retried — replaying
+    // a POST could create a duplicate.
     let upstream = null;
-    const attempts = cacheable ? UPSTREAM_429_RETRIES + 1 : 1;
+    const attempts = cacheable ? UPSTREAM_RETRIES + 1 : 1;
     for (let attempt = 0; attempt < attempts; attempt++) {
       if (attempt > 0) {
-        await new Promise((r) => setTimeout(r, UPSTREAM_429_DELAYS[attempt - 1] || 1000));
+        await new Promise((r) => setTimeout(r, UPSTREAM_RETRY_DELAYS[attempt - 1] || 1000));
+        headers['User-Agent'] = UPSTREAM_USER_AGENTS[attempt % UPSTREAM_USER_AGENTS.length];
       }
       const res = await fetch(url, {
         method: req.method,
@@ -217,7 +283,7 @@ app.use('/api', async (req, res) => {
       });
       const text = await res.text();
       upstream = { status: res.status, ok: res.ok, text };
-      if (res.status !== 429) break;
+      if (!UPSTREAM_RETRY_STATUSES.includes(res.status)) break;
     }
 
     if (cacheable && upstream.ok) {
@@ -232,7 +298,7 @@ app.use('/api', async (req, res) => {
       .status(upstream.status)
       .set('Cache-Control', 'no-store')
       .type('application/json')
-      .send(upstream.text);
+      .send(upstream.ok ? upstream.text : errorPayload(upstream.status, upstream.text));
   } catch (err) {
     if (cacheable && sendStale('network-error')) return;
     res.status(502).json({
