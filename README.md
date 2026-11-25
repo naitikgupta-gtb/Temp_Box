@@ -104,6 +104,28 @@ reach your deployed TempBox instance can therefore open a Gmail session.** That 
 Google account is recommended, and why the app password should be revoked the moment you stop using
 the feature.
 
+The password lives in the browser tab only, so it disappears when the tab closes. Reconnect after a
+server restart and the app re-uses it; after a closed tab you type it once more.
+
+### The host must be able to open the IMAP port
+
+Gmail speaks IMAP on **port 993**. A host that only allows outbound HTTP(S) cannot use Gmail mode —
+the connection is refused or black-holed. Check any host in one call, no credentials needed:
+
+```bash
+curl https://your-host/api/gmail/check
+# {"ok":true,"host":"imap.gmail.com","port":993,"secure":true,"ms":252}
+# {"ok":false,...,"error":"Cannot reach the mail server (imap.gmail.com): connect ECONNREFUSED …"}
+```
+
+The app also says so in the UI: a blocked port comes back as `424` with *“This server cannot open the
+IMAP port (imap.gmail.com:993)”* instead of a generic error, so a CDN in front of the app cannot
+hide the reason.
+
+Container platforms often restrict outbound ports. If your host blocks 993, either move the app to a
+host with open egress, or use Gmail mode from a machine that has it (a laptop or a VPS) — the
+disposable mode keeps working everywhere.
+
 ### Requirements and limits
 
 - The deployment host must be able to reach `imap.gmail.com:993`. Some container platforms block
@@ -160,6 +182,7 @@ Allowed upstream paths: `/domains`, `/token`, `/accounts`, `/accounts/:id`, `/me
 | `POST /api/gmail/login` | verify the app password over IMAP → session token |
 | `POST /api/gmail/logout` | drop the session (and the stored password) |
 | `GET /api/gmail/session` | is the session still alive? |
+| `GET /api/gmail/check` | can this host open the IMAP port at all? (no credentials) |
 | `GET /api/gmail/messages?alias=` | list the mail addressed to one alias |
 | `GET /api/gmail/messages/:uid` | full message (headers + body) |
 

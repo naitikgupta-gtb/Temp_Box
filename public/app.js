@@ -39,7 +39,10 @@
     // Which backend the inbox reads from: a disposable domain (mail.tm) or
     // real @gmail.com aliases minted off the user's own Gmail account.
     source: 'mailtm',
-    gmail: { token: '', user: '', domain: '' },
+    gmail: { token: '', user: '', domain: '', forceClear: false },
+    // Ids of inboxes that were deleted on purpose. Kept so that merging the
+    // saved state cannot resurrect a deleted inbox.
+    deleted: new Set(),
   };
 
   // Signatures of what is currently rendered, so the 3s poll does not rebuild
@@ -50,14 +53,41 @@
   const detailAttempted = new Set();
 
   /* ── storage ─────────────────────────────────────────────── */
+  /**
+   * Persist the state.
+   *
+   * The state is merged with what is already stored instead of overwriting
+   * it: another tab of this app (or a tab that lost its session) must never
+   * be able to wipe the inbox list or the Gmail token of the whole app.
+   */
   function save() {
     try {
+      let stored = {};
+      try { stored = JSON.parse(localStorage.getItem(STORE_KEY) || '{}') || {}; } catch (_) {}
+
+      const merged = new Map();
+      (stored.boxes || []).forEach((b) => { if (b && b.id) merged.set(b.id, b); });
+      state.boxes.forEach((b) => merged.set(b.id, {
+        id: b.id, address: b.address, password: b.password, token: b.token,
+        createdAt: b.createdAt, knownIds: Array.from(b.knownIds || []),
+        provider: b.provider || 'mailtm', gmailToken: b.gmailToken || null,
+      }));
+
+      const deleted = new Set([...(stored.deleted || []), ...(state.deleted || [])]);
+      const boxes = [...merged.values()].filter((b) => !deleted.has(b.id));
+
+      let gmail = stored.gmail || { token: '', user: '', domain: '' };
+      if (state.gmail.forceClear) {
+        // The user asked to forget the account on purpose.
+        gmail = { token: '', user: '', domain: '' };
+        state.gmail.forceClear = false;
+      } else if (state.gmail.token) {
+        gmail = { token: state.gmail.token, user: state.gmail.user, domain: state.gmail.domain };
+      }
+
       localStorage.setItem(STORE_KEY, JSON.stringify({
-        boxes: state.boxes.map((b) => ({
-          id: b.id, address: b.address, password: b.password, token: b.token,
-          createdAt: b.createdAt, knownIds: Array.from(b.knownIds || []),
-          provider: b.provider || 'mailtm', gmailToken: b.gmailToken || null,
-        })),
+        boxes,
+        deleted: [...deleted],
         activeId: state.activeId,
         selectedId: state.selectedId,
         domain: state.domain,
@@ -65,7 +95,7 @@
         auto: state.auto,
         sound: state.sound,
         source: state.source,
-        gmail: { token: state.gmail.token, user: state.gmail.user, domain: state.gmail.domain },
+        gmail,
       }));
     } catch (_) { /* storage may be unavailable */ }
   }
@@ -75,9 +105,12 @@
       const raw = localStorage.getItem(STORE_KEY);
       if (!raw) return;
       const data = JSON.parse(raw);
-      state.boxes = (data.boxes || []).map((b) => ({
-        ...b, messages: [], knownIds: new Set(b.knownIds || []), unread: 0,
-      }));
+      state.deleted = new Set(data.deleted || []);
+      state.boxes = (data.boxes || [])
+        .filter((b) => b && !state.deleted.has(b.id))
+        .map((b) => ({
+          ...b, messages: [], knownIds: new Set(b.knownIds || []), unread: 0,
+        }));
       state.activeId = data.activeId && state.boxes.some((b) => b.id === data.activeId)
         ? data.activeId
         : (state.boxes[0] && state.boxes[0].id) || null;
@@ -131,6 +164,8 @@
       const msg = (data && (data['hydra:description'] || data.error || data.message || data['hydra:title'])) || `HTTP ${res.status}`;
       const err = new Error(msg);
       err.status = res.status;
+      if (data && data.detail) err.detail = data.detail;
+      if (data && data.hint) err.hint = data.hint;
       throw err;
     }
     return data;
@@ -293,7 +328,9 @@
         if (err.status === 401) {
           const back = await restoreGmailSession();
           if (!back) {
+            // The server says this session is gone — drop it for good.
             state.gmail.token = '';
+            state.gmail.forceClear = true;
             save();
             renderSource();
             throw err;
@@ -539,7 +576,8 @@
     if (token) {
       try { await api('/gmail/logout', { method: 'POST', token }); } catch (_) { /* already gone */ }
     }
-    state.gmail = { token: '', user: '', domain: '' };
+    state.gmail = { token: '', user: '', domain: '', forceClear: true };
+    state.boxes.filter((b) => b.provider === 'gmail').forEach((b) => state.deleted.add(b.id));
     state.boxes = state.boxes.filter((b) => b.provider !== 'gmail');
     if (!state.boxes.some((b) => b.id === state.activeId)) {
       state.activeId = state.boxes.length ? state.boxes[0].id : null;
@@ -666,6 +704,7 @@
       await api(`/accounts/${box.id}`, { method: 'DELETE', token: box.token });
     } catch (_) { /* best effort */ }
     state.boxes = state.boxes.filter((b) => b.id !== box.id);
+    state.deleted.add(box.id);
     if (state.activeId === box.id) {
       state.activeId = state.boxes[0] ? state.boxes[0].id : null;
       state.selectedId = null;
@@ -1059,7 +1098,8 @@
           await createBox($('localInput').value);
         }
       } catch (err) {
-        toast('Cannot connect Gmail: ' + err.message, 'err');
+        const hint = err.hint ? ' — ' + err.hint : '';
+        toast('Cannot connect Gmail: ' + err.message + hint, 'err');
       } finally {
         btn.disabled = false;
       }
@@ -1247,6 +1287,7 @@
       // reconnecting — try the stored app password first.
       await restoreGmailSession();
       renderSource();
+      renderAll();
       if (state.gmail.token && !state.boxes.length) {
         try {
           await createBox($('localInput').value);

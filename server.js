@@ -201,9 +201,49 @@ app.post('/api/gmail/login', async (req, res) => {
       domain: user.split('@')[1] || 'gmail.com',
     });
   } catch (err) {
-    res.status(502).json({
-      error: 'Cannot connect to Gmail',
-      detail: (err && err.message) || String(err),
+    const code = (err && err.code) || 'imap';
+    const detail = (err && err.message) || String(err);
+    // A 4xx keeps the explanation visible: a CDN sitting in front of the app
+    // replaces the body of a 5xx with its own generic "error code: 502" page.
+    const unreachable = code === 'connect' || code === 'timeout' || code === 'network';
+    if (unreachable) {
+      res.status(424).json({
+        error: `This server cannot open the IMAP port (${IMAP_HOST}:${IMAP_PORT})`,
+        detail,
+        hint: 'The host blocks outbound IMAP. Gmail mode needs a host that allows that port — '
+          + 'GET /api/gmail/check says whether it is reachable.',
+      });
+      return;
+    }
+    res.status(401).json({
+      error: 'Gmail refused the login — check the address and the app password',
+      detail,
+    });
+  }
+});
+
+/**
+ * Is the IMAP port reachable from here? No credentials needed, so a host can
+ * be checked before anybody types a password.
+ */
+app.get('/api/gmail/check', async (req, res) => {
+  const started = Date.now();
+  const base = { host: IMAP_HOST, port: IMAP_PORT, secure: IMAP_SECURE };
+  try {
+    const conn = new imap.ImapConnection({ ...base, timeout: 8000 });
+    try {
+      await conn.connect();
+    } finally {
+      conn.close();
+    }
+    res.status(200).set('Cache-Control', 'no-store').json({ ok: true, ...base, ms: Date.now() - started });
+  } catch (err) {
+    res.status(200).set('Cache-Control', 'no-store').json({
+      ok: false,
+      ...base,
+      ms: Date.now() - started,
+      error: (err && err.message) || String(err),
+      hint: 'Gmail mode needs a host that can open this port outbound.',
     });
   }
 });
@@ -247,9 +287,16 @@ app.get('/api/gmail/messages', async (req, res) => {
       'hydra:totalItems': entries.length,
     });
   } catch (err) {
-    res.status(502).json({
-      error: 'Cannot read the Gmail inbox',
+    const code = (err && err.code) || 'imap';
+    const unreachable = code === 'connect' || code === 'timeout' || code === 'network';
+    res.status(unreachable ? 424 : 502).json({
+      error: unreachable
+        ? `This server cannot open the IMAP port (${IMAP_HOST}:${IMAP_PORT})`
+        : 'Cannot read the Gmail inbox',
       detail: (err && err.message) || String(err),
+      hint: unreachable
+        ? 'The host blocks outbound IMAP. Gmail mode needs a host that allows that port.'
+        : undefined,
     });
   }
 });
